@@ -146,7 +146,9 @@ def classify(interpreter, crop, class_names):
 
     img = cv2.resize(crop, (width, height))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
-    img = (img / 127.5) - 1.0  # 3번 스크립트의 MobileNetV2 전처리와 동일하게 맞춤
+    # 정규화(1/127.5, offset=-1)는 3번 스크립트에서 모델 안에 레이어로 이미
+    # 포함되어 tflite로 변환됨 -> 여기서 또 나누면 이중 정규화가 되어 입력값이
+    # 전부 -1.01~-0.99 사이로 뭉개짐 (항상 같은 클래스만 나오는 원인)
     img = np.expand_dims(img, axis=0)
 
     interpreter.set_tensor(input_details[0]["index"], img)
