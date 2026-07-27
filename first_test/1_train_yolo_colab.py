@@ -14,21 +14,12 @@
 # !pip install ultralytics roboflow -q
 
 # --- 1) Roboflow에서 바운딩박스 라벨 포함 데이터셋 다운로드 ---
-#from roboflow import Roboflow
-
-# ROBOFLOW_API_KEY = "여기에_본인_API_KEY_입력"
-# WORKSPACE = "여기에_workspace_이름"
-# PROJECT = "여기에_project_이름"
-# VERSION = 1  # Roboflow 프로젝트 버전 번호
-
-
-#!pip install roboflow
 from roboflow import Roboflow
-rf = Roboflow(api_key="08pEqA03ywLShGQ8Vk09")
-project = rf.workspace("s-workspace-ntur3").project("1trashset")
-dataset = project.version(1).download("yolov8")
 
-
+ROBOFLOW_API_KEY = "08pEqA03ywLShGQ8Vk09"
+WORKSPACE = "s-workspace-ntur3"
+PROJECT = "1trashset"
+VERSION = 1  # Roboflow 프로젝트 버전 번호
 
 rf = Roboflow(api_key=ROBOFLOW_API_KEY)
 project = rf.workspace(WORKSPACE).project(PROJECT)
