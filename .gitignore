@@ -22,6 +22,7 @@ env/
 *.weights
 *.engine
 *.bin
+*.keras
 
 # 데이터셋 및 로그
 data/
@@ -29,6 +30,12 @@ datasets/
 runs/
 wandb/
 logs/
+cnn_dataset/
+1trashset-*/
+
+# 실행 중 생성되는 로그/스냅샷 (Jetson에서 테스트하며 생기는 파일)
+*.db
+test_snapshots/
 
 # Mac 시스템 파일
 .DS_Store
