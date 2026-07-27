@@ -16,7 +16,7 @@ env/
 .vscode/
 
 # 딥러닝 모델 가중치 파일 (대용량 파일)
-*.pt
+# *.pt 는 YOLO 배포용 가중치(best.pt/last.pt)라 추적함
 *.pth
 *.onnx
 *.weights
