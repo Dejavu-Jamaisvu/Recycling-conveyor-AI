@@ -1,0 +1,46 @@
+# ===== STM32CubeIDE / CubeMX =====
+
+# 빌드 출력물
+Debug/
+Release/
+
+# CubeIDE 설정 (개인 환경마다 달라지는 파일들)
+.settings/
+.metadata/
+
+# CubeMX 백업/임시
+*.mxproject
+MXTmpFiles/
+
+# ===== Eclipse 기반 (CubeIDE가 Eclipse 기반) =====
+*.launch
+.pydevproject
+
+# ===== OS 임시 파일 =====
+
+# Windows
+Thumbs.db
+desktop.ini
+*.tmp
+
+# macOS
+.DS_Store
+._*
+
+# ===== 에디터/IDE =====
+
+# VS Code (혹시 같이 쓰셨으면)
+.vscode/
+
+# JetBrains
+.idea/
+
+# ===== 기타 =====
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.log
