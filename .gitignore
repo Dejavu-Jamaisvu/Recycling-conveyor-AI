@@ -27,7 +27,6 @@ env/
 # 데이터셋 및 로그
 data/
 datasets/
-runs/
 wandb/
 logs/
 cnn_dataset/
