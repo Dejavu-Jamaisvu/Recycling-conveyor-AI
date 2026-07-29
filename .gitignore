@@ -19,7 +19,6 @@ env/
 # *.pt 는 YOLO 배포용 가중치(best.pt/last.pt)라 추적함
 *.pth
 *.onnx
-*.weights
 *.engine
 *.bin
 *.keras
