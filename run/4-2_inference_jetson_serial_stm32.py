@@ -1,11 +1,24 @@
 # =====================================================================
 # 4-2단계 수정본: Jetson Nano 실시간 추론 (STM32와 UART 핀헤더 연결 버전)
 # =====================================================================
-# 원본(4-2_inference_jetson_serial_stm32.py)에서 바뀐 곳 — 딱 3군데:
+# 하드웨어 수정 사항 (본인이 실측/테스트해서 반영한 것, 그대로 유지):
 #   [수정1] SERIAL_PORT: /dev/ttyACM0 → /dev/ttyTHS1 (J41 핀헤더 UART)
 #   [수정2] 카메라 버퍼 크기 1로 설정 (최신 프레임 유지)
-#   [수정3] TRIGGER 수신 시 촬영 전에 묵은 프레임 버리기
-#           (버퍼에 쌓인 "물체 도착 전" 장면이 찍히는 문제 방지)
+#   [수정3] 카메라 워밍업 10프레임 (노출 안정화)
+#
+# 이번에 추가한 것:
+#   [수정4] 카메라 미리보기 창 추가 (cv2.imshow) + 분류 결과 화면 오버레이
+#   [수정5] 시리얼 수신을 별도 스레드로 분리
+#           (원래 ser.readline()이 메인 스레드를 막고 있어서 미리보기를
+#            같이 띄울 수 없었음. 스레드에서 "TRIGGER" 감지만 하고,
+#            실제 촬영/분류는 메인 스레드의 미리보기 루프에서 처리)
+#
+# [수정3']에 대한 참고: 원래 있던 "TRIGGER 수신 시 묵은 프레임 4장 버리기"는
+# 뺐습니다. 이제 미리보기 루프가 매 프레임 cap.read()를 계속 호출하고 있어서
+# (기존엔 대기 중엔 read()를 아예 안 불러서 버퍼에 묵은 프레임이 쌓였던 것),
+# TRIGGER가 왔을 때 쓰는 frame은 항상 그 순간 막 읽은 최신 프레임입니다.
+# 오히려 4번 더 읽는 건 트리거 순간에 불필요한 지연만 추가하는 셈이라 제거했고,
+# BUFFERSIZE=1 설정은 그대로 유지했습니다 (안전장치로 유지하는 게 좋음).
 #
 # 배선: Jetson 핀8(TXD)→STM32 PA10, 핀10(RXD)→PA9, 핀6 GND→GND
 #
@@ -13,6 +26,21 @@
 #   sudo systemctl stop nvgetty && sudo systemctl disable nvgetty
 #   sudo usermod -aG dialout $USER
 #   sudo reboot
+#
+# 폴더 구조 (3개 폴더로 분리, models/는 모델별 하위 폴더로 구성)
+#   project/
+#   ├── models/
+#   │   ├── model_freeze/     classifier.tflite, class_names.txt
+#   │   └── model_finetune/   classifier.tflite, class_names.txt
+#   ├── run/     이 스크립트 + 4-1 계열 스크립트들 + model_select.py
+#   └── db/      points.py, db_setup.py, db_view.py, *.db
+#
+# 실행할 때 어떤 모델을 쓸지 고를 수 있습니다.
+#   python3 4-2_inference_jetson_serial_stm32.py                 실행 중 번호로 선택
+#   python3 4-2_inference_jetson_serial_stm32.py model_finetune   바로 지정
+#
+# 주의: 카메라 미리보기 창(cv2.imshow)을 띄우므로 모니터가 연결된 상태에서
+# (SSH 원격 접속이 아니라 Jetson 본체 데스크톱에서, 또는 VNC로) 실행해야 합니다.
 # =====================================================================
 
 import os
@@ -43,7 +71,7 @@ except ImportError:
 # ---------------------------------------------------------------------
 # 설정값
 # ---------------------------------------------------------------------
-SERIAL_PORT = "/dev/ttyTHS1"   # [수정1] J41 핀헤더 UART (기존: /dev/ttyACM0)
+SERIAL_PORT = "/dev/ttyTHS1"   # [수정1] J41 핀헤더 UART
 SERIAL_BAUDRATE = 115200       # STM32 USART1 설정과 동일
 
 FIXED_ROI = None               # 예: (150, 80, 450, 380) — last_capture.jpg 보고 조정
@@ -51,7 +79,13 @@ CNN_CONF_THRESHOLD = 0.6
 CAMERA_INDEX = 0
 DB_PATH = os.path.join(DB_DIR, "sorting_log.db")
 
+LAST_CAPTURE_PATH = os.path.join(BASE_DIR, "last_capture.jpg")  # ROI 조정용 디버그 저장
+
 current_user = {"phone": None}
+
+# STM32로부터 "TRIGGER"를 받으면 이 이벤트를 세팅합니다.
+# (시리얼 읽기는 별도 스레드, 카메라 미리보기+분류는 메인 스레드에서 동시에 처리)
+trigger_event = threading.Event()
 
 
 # ---------------------------------------------------------------------
@@ -97,6 +131,24 @@ def input_thread_func():
             print("전화번호는 숫자만, 4자리 이상 입력해주세요.")
 
 
+# ---------------------------------------------------------------------
+# [수정5] STM32 시리얼 수신 스레드 ("TRIGGER" 감지 -> trigger_event만 세팅)
+# 실제 촬영/분류/응답은 메인 스레드(카메라 미리보기 루프)에서 처리합니다.
+# ---------------------------------------------------------------------
+def serial_listener_func(ser):
+    while True:
+        try:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+        except serial.SerialException:
+            print("[시리얼] 연결이 끊겼습니다.")
+            return
+        if not line:
+            continue
+        print("[시리얼 수신]", line)
+        if line == "TRIGGER":
+            trigger_event.set()
+
+
 def apply_roi(frame):
     if FIXED_ROI is None:
         return frame
@@ -125,7 +177,7 @@ def classify(interpreter, image, class_names):
 
 
 # ---------------------------------------------------------------------
-# 메인 루프
+# 메인 루프 (카메라 미리보기 + TRIGGER 처리를 함께 수행)
 # ---------------------------------------------------------------------
 def main():
     conn = init_db()
@@ -144,53 +196,81 @@ def main():
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # [수정2] 프레임 버퍼 최소화
-    for _ in range(10):                   # 카메라 워밍업 (노출 안정화)
+    if not cap.isOpened():
+        print(f"카메라(index={CAMERA_INDEX})를 열 수 없습니다. CAMERA_INDEX 값을 확인하세요.")
+        return
+    for _ in range(10):                   # [수정3] 카메라 워밍업 (노출 안정화)
         cap.read()
 
     threading.Thread(target=input_thread_func, daemon=True).start()
+    threading.Thread(target=serial_listener_func, args=(ser,), daemon=True).start()
 
-    print("대기 중... (STM32로부터 TRIGGER 신호 대기, Ctrl+C로 종료)")
+    window_name = "Camera Preview (STM32 TRIGGER 자동 촬영) - Q: Quit"
+    last_result_text = ""
+    last_result_until = 0.0
+
+    print("대기 중... (STM32로부터 TRIGGER 신호 대기, 미리보기 창에서 Q로 종료)")
     try:
         while True:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
+            ret, frame = cap.read()
+            if not ret:
+                print("카메라 촬영 실패")
+                break
 
-            print("수신:", line)
+            # --- 미리보기 화면 구성 ---
+            display = frame.copy()
+            if FIXED_ROI is not None:
+                x1, y1, x2, y2 = FIXED_ROI
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            if line == "TRIGGER":
-                # [수정3] 버퍼에 남은 묵은 프레임 버리고 최신 프레임 확보
-                for _ in range(4):
-                    cap.read()
+            user_label = current_user["phone"] if current_user["phone"] else "게스트"
+            cv2.putText(
+                display, f"user: {user_label}", (10, display.shape[0] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2,
+            )
 
-                # 1) 촬영
-                ret, frame = cap.read()
-                if not ret:
-                    print("카메라 촬영 실패 -> unknown으로 응답")
-                    ser.write(b"CLASS:unknown\n")
-                    continue
+            if last_result_text and time.time() < last_result_until:
+                cv2.putText(
+                    display, last_result_text, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+                )
+            cv2.imshow(window_name, display)
 
-                cv2.imwrite("last_capture.jpg", frame)   # ROI 조정용 디버그 저장
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), ord("Q"), 27):  # 27 = ESC
+                break
 
-                # 2) 고정 ROI 적용 후 CNN 분류
+            # --- STM32 TRIGGER 처리 ---
+            # frame은 이 루프 이번 회차에서 방금 막 읽은 최신 프레임이라
+            # 따로 "묵은 프레임 버리기"가 필요 없습니다.
+            if trigger_event.is_set():
+                trigger_event.clear()
+
+                cv2.imwrite(LAST_CAPTURE_PATH, frame)  # ROI 조정용 디버그 저장
+
+                # 1) 고정 ROI 적용 후 CNN 분류
                 image = apply_roi(frame)
                 cnn_class, cnn_conf = classify(cnn_interpreter, image, class_names)
                 print(f"CNN class={cnn_class} conf={cnn_conf:.2f}")
 
                 final_class = cnn_class if cnn_conf >= CNN_CONF_THRESHOLD else "unknown"
 
-                # 3) 결과를 STM32로 전송
+                # 화면에 결과 3초간 표시
+                last_result_text = f"{final_class} ({cnn_conf:.2f})"
+                last_result_until = time.time() + 3
+
+                # 2) 결과를 STM32로 전송
                 ser.write(f"CLASS:{final_class}\n".encode("utf-8"))
 
-                # 4) 포인트 적립
+                # 3) 포인트 적립
                 phone = current_user["phone"]
                 points = 0
                 if phone:
                     points = award_points(conn, phone, final_class)
                     if points > 0:
-                        print(f"[포인트] {phone}님 +{points}점 적립!")
+                        print(f"  [포인트] {phone}님 +{points}점 적립!")
 
-                # 5) DB 기록
+                # 4) DB 기록
                 conn.execute(
                     """
                     INSERT INTO sorting_log
@@ -205,9 +285,19 @@ def main():
         print("\n종료 중...")
     finally:
         cap.release()
+        cv2.destroyAllWindows()
         ser.close()
         conn.close()
 
 
 if __name__ == "__main__":
     main()
+
+# =====================================================================
+# 확인/맞춰야 할 것
+#   - SERIAL_PORT: 핀헤더 UART가 아니라면 /dev/ttyACM0 등으로 다시 바꿀 것
+#   - SERIAL_BAUDRATE: STM32 펌웨어의 Serial.begin(baudrate) 값과 반드시 일치
+#   - "TRIGGER" / "CLASS:xxx" 문자열 프로토콜은 STM32 펌웨어 쪽에도 동일하게 구현
+#   - FIXED_ROI: last_capture.jpg 확인하면서 좌표 조정
+#   - 모니터가 연결된 Jetson 본체 데스크톱(또는 VNC)에서 실행해야 미리보기 창이 뜸
+# =====================================================================
