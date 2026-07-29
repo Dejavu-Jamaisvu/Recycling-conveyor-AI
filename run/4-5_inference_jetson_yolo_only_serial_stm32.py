@@ -290,33 +290,70 @@ def _find_candidate_dirs():
     return dirs
 
 
+def find_detector_candidates():
+    """best.pt 또는 detector.tflite가 있는 폴더를 전부 찾아서
+    (폴더경로, 종류) 목록으로 반환. 종류는 'pt' 또는 'tflite'."""
+    candidates = []
+    for d in _find_candidate_dirs():
+        if os.path.exists(os.path.join(d, "best.pt")):
+            candidates.append((d, "pt"))
+        if os.path.exists(os.path.join(d, "detector.tflite")):
+            candidates.append((d, "tflite"))
+    return candidates
+
+
+def _load_candidate(folder, kind):
+    if kind == "pt":
+        path = os.path.join(folder, "best.pt")
+        print(f"YOLO(.pt, ultralytics) 로딩... ({path})")
+        return UltralyticsDetector(path)
+    else:
+        path = os.path.join(folder, "detector.tflite")
+        labels_path = os.path.join(folder, "detector_labels.txt")
+        print(f"YOLO(.tflite) 로딩... ({path})")
+        return TFLiteDetector(path, labels_path)
+
+
 def load_detector():
-    search_dirs = _find_candidate_dirs()
+    """찾은 YOLO 모델이 여러 개면 CNN 모델 선택(model_select.py)과 똑같이
+    번호로 고르게 합니다. 커맨드라인 인자로 폴더명을 바로 줄 수도 있음
+    (예: python3 4-5_....py 3class)."""
+    candidates = find_detector_candidates()
+    if not candidates:
+        print(f"YOLO 모델을 찾지 못했습니다 (찾아본 위치: {', '.join(_find_candidate_dirs())})")
+        print("models/detector/ 안에 best.pt 또는 detector.tflite를 넣어주세요.")
+        sys.exit(1)
 
-    for d in search_dirs:
-        pt_path = os.path.join(d, "best.pt")
-        if os.path.exists(pt_path):
-            print(f"YOLO(.pt, ultralytics) 로딩 시도... ({pt_path})")
-            try:
-                return UltralyticsDetector(pt_path)
-            except Exception as e:
-                print(f"best.pt 로딩 실패 ({e})")
-                print('-> 확인: python3 -c "import torch, ultralytics"')
-                print("-> 다른 위치/파일이 있으면 이어서 찾아봅니다.")
+    chosen = None
 
-    for d in search_dirs:
-        tflite_path = os.path.join(d, "detector.tflite")
-        if os.path.exists(tflite_path):
-            print(f"YOLO(.tflite) 로딩... ({tflite_path})")
-            labels_path = os.path.join(d, "detector_labels.txt")
-            try:
-                return TFLiteDetector(tflite_path, labels_path)
-            except Exception as e:
-                print(f"detector.tflite 로딩 실패: {e}")
+    if len(sys.argv) > 1:
+        names = [os.path.basename(d) for d, _ in candidates]
+        if sys.argv[1] in names:
+            chosen = candidates[names.index(sys.argv[1])]
 
-    print(f"YOLO 모델을 찾지 못했습니다 (찾아본 위치: {', '.join(search_dirs)})")
-    print("models/detector/ 안에 best.pt 또는 detector.tflite를 넣어주세요.")
-    sys.exit(1)
+    if chosen is None:
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            print("\n사용 가능한 YOLO 모델:")
+            for i, (d, kind) in enumerate(candidates, 1):
+                print(f"  {i}. {os.path.basename(d)} ({kind})")
+            while True:
+                sel = input("사용할 YOLO 모델 번호 입력 > ").strip()
+                if sel.isdigit() and 1 <= int(sel) <= len(candidates):
+                    chosen = candidates[int(sel) - 1]
+                    break
+                print("올바른 번호를 입력하세요.")
+
+    folder, kind = chosen
+    print(f"[YOLO 모델 선택] {os.path.basename(folder)} ({kind})")
+    try:
+        return _load_candidate(folder, kind)
+    except Exception as e:
+        print(f"로딩 실패: {e}")
+        if kind == "pt":
+            print('-> 확인: python3 -c "import torch, ultralytics"')
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------

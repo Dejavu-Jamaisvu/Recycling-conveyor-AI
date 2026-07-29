@@ -1,18 +1,20 @@
 # =====================================================================
-# 재활용 분류 시스템 - 통합 GUI 대시보드 (PyQt5, YOLO 단독 버전)
+# 재활용 분류 시스템 - 통합 GUI 대시보드 (PyQt5, 하이브리드 버전)
 # =====================================================================
-# gui_dashboard.py(CNN 분류)와 다른 점: CNN 단계가 없습니다. YOLO 모델이
-# 위치(바운딩박스)와 클래스(metal/plastic/paper)를 한 번의 추론으로 같이
-# 내놓기 때문에 그 결과를 그대로 최종 분류로 씁니다. 4-5_inference_jetson_
-# yolo_only_serial_stm32.py 의 GUI 버전이라고 보면 됩니다.
+# YOLO 먼저 시도하고, 확신도가 낮아 unknown이면 CNN으로 재시도합니다.
+# (CNN 쪽은 models/ 안에 모델이 여러 개면 그것도 순서대로 재시도합니다 -
+#  gui_dashboard.py의 다중모델 재시도 기능과 동일)
 #
-# YOLO 모델은 두 가지 방식을 지원합니다 (아래 우선순위로 자동 선택).
-#   1) best.pt          - ultralytics로 바로 로딩. 클래스 이름이 모델 파일
-#      안에 이미 저장돼 있어서 별도 파일 필요 없음. (torch/ultralytics 필요)
-#   2) detector.tflite  - tflite_runtime으로 로딩. 같은 폴더에
-#      detector_labels.txt가 같이 있어야 클래스 이름을 알 수 있음.
-#   찾는 위치: models/detector/ 를 먼저 보고, 없으면 models/ 바로 아래 모든
-#   하위 폴더를 하나씩 뒤집니다 (예: models/3class/best.pt 도 인식됨).
+# 판단 순서: YOLO 시도 -> 확신도 충분하면 그 결과로 확정
+#            -> 부족하면(unknown) CNN 시도(모델 여러 개면 순서대로) -> 확정
+#            -> 그것도 다 부족하면 최종 unknown
+#
+# 화면에는 최종 결정뿐 아니라 YOLO/CNN 각각 뭐라고 판단했는지도 같이
+# 표시해서, 두 모델이 얼마나 일치/불일치하는지 비교해볼 수 있습니다.
+#
+# YOLO는 선택 사항입니다 - models/detector/ (또는 models/아무폴더/)에
+# best.pt나 detector.tflite가 없으면 자동으로 건너뛰고 CNN만 사용합니다.
+# CNN 모델은 필수입니다 (models/모델이름/classifier.tflite + class_names.txt).
 #
 # 클래스 이름은 정확히 "metal"/"plastic"/"paper"(소문자)여야 포인트가
 # 정상 적립됩니다 (db/points.py의 POINTS_PER_CLASS 참고).
@@ -24,16 +26,19 @@
 # 설치 (Jetson Nano에서는 pip보다 apt 패키지가 훨씬 빠르게 설치됩니다):
 #   sudo apt install python3-pyqt5 python3-matplotlib fonts-nanum
 #   pip3 install pyserial opencv-python --break-system-packages
-#   pip3 install tflite-runtime          # detector.tflite 쓸 경우
+#   pip3 install tflite-runtime          # CNN + detector.tflite 쓸 경우
 #   pip3 install ultralytics             # best.pt 직접 쓸 경우 (torch 필요)
 #
-# 실행 (run/ 폴더 안에서): python3 gui_dashboard_yolo_only.py
+# 실행 (run/ 폴더 안에서):
+#   python3 gui_dashboard_hybrid.py                 CNN 모델 번호로 선택
+#   python3 gui_dashboard_hybrid.py model_finetune   CNN 모델 바로 지정
 #
 # 폴더 구조
 #   project/
-#   ├── models/detector/ (또는 아무 하위 폴더)   best.pt 또는
-#   │                                             detector.tflite + detector_labels.txt
-#   ├── run/     이 스크립트 + 4-x 스크립트들
+#   ├── models/
+#   │   ├── model_xxx/    classifier.tflite, class_names.txt   (CNN, 필수)
+#   │   └── detector/      best.pt 또는 detector.tflite          (YOLO, 선택)
+#   ├── run/     이 스크립트 + 4-x 스크립트들 + model_select.py
 #   └── db/      points.py, db_setup.py, db_view.py, *.db
 # =====================================================================
 
@@ -75,6 +80,7 @@ DB_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "db"))
 
 sys.path.append(DB_DIR)
 from points import init_users_table, award_points, is_valid_phone, get_leaderboard, get_points
+from model_select import select_model, list_available_models
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -87,19 +93,19 @@ except ImportError:
 # ---------------------------------------------------------------------
 SERIAL_PORT = "/dev/ttyTHS1"     # STM32 핀헤더 UART. USB 연결이면 /dev/ttyACM0 등으로 변경
 SERIAL_BAUDRATE = 115200
+FIXED_ROI = None                  # YOLO가 없거나 못 찾았을 때 CNN에 쓸 좌표. 예: (150, 80, 450, 380)
+CNN_CONF_THRESHOLD = 0.6
 CAMERA_INDEX = 0
 DB_PATH = os.path.join(DB_DIR, "sorting_log.db")
 LAST_CAPTURE_PATH = os.path.join(BASE_DIR, "last_capture.jpg")
 RECENT_LOG_ROWS = 15
 
 DETECTOR_DIR = os.path.join(MODELS_DIR, "detector")
-DETECTOR_CONF_THRESHOLD = 0.5   # 이 미만이면 "unknown" (CNN이 없으니 이 값이 최종 기준)
-DETECTOR_INTERVAL_MS = 250      # 미리보기용 박스 갱신 주기 (매 프레임 돌리면 Nano에 부담)
+DETECTOR_CONF_THRESHOLD = 0.5    # 이 이상이면 YOLO 결과를 바로 최종으로 사용
+DETECTOR_INTERVAL_MS = 250       # 미리보기용 박스 갱신 주기
 
 
 def _ensure_column(conn, table, column, coltype):
-    """예전 스크립트(4-1~4-4)로 이미 만들어진 sorting_log.db를 이어서 쓸 때
-    새로 추가된 컬럼이 없으면 채워넣습니다."""
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
@@ -113,6 +119,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
             phone TEXT,
+            cnn_class TEXT,
+            cnn_confidence REAL,
             yolo_class TEXT,
             yolo_confidence REAL,
             final_class TEXT,
@@ -120,9 +128,6 @@ def init_db():
         )
         """
     )
-    # 예전 CNN 버전 스크립트(db_setup.py 등)로 테이블이 먼저 만들어졌으면
-    # cnn_class/cnn_confidence가 NOT NULL로 정의돼 있을 수 있음 - 이후 INSERT에서
-    # 같이 채워넣어서 대응함 (아래 _on_trigger 참고)
     _ensure_column(conn, "sorting_log", "yolo_class", "TEXT")
     _ensure_column(conn, "sorting_log", "yolo_confidence", "REAL")
     _ensure_column(conn, "sorting_log", "points_awarded", "INTEGER NOT NULL DEFAULT 0")
@@ -131,9 +136,41 @@ def init_db():
     return conn
 
 
+def load_class_names(class_names_path):
+    with open(class_names_path, encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def classify(interpreter, image, class_names):
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    height, width = input_details[0]["shape"][1:3]
+
+    img = cv2.resize(image, (width, height))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+    img = np.expand_dims(img, axis=0)
+
+    # 모델(.tflite) 안에 Rescaling 레이어가 이미 포함되어 있으므로
+    # 여기서 픽셀값을 추가로 정규화하면 안 됨 (이중정규화 버그 주의)
+    interpreter.set_tensor(input_details[0]["index"], img)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details[0]["index"])[0]
+
+    idx = int(np.argmax(output))
+    return class_names[idx], float(output[idx])
+
+
+def apply_roi(frame):
+    if FIXED_ROI is None:
+        return frame
+    x1, y1, x2, y2 = FIXED_ROI
+    return frame[y1:y2, x1:x2]
+
+
 def fetch_recent_log(conn, limit=RECENT_LOG_ROWS):
     cursor = conn.execute(
-        "SELECT id, timestamp, phone, yolo_class, yolo_confidence, final_class, points_awarded "
+        "SELECT id, timestamp, phone, cnn_class, cnn_confidence, yolo_class, "
+        "yolo_confidence, final_class, points_awarded "
         "FROM sorting_log ORDER BY id DESC LIMIT ?",
         (limit,),
     )
@@ -141,7 +178,6 @@ def fetch_recent_log(conn, limit=RECENT_LOG_ROWS):
 
 
 def fetch_class_counts(conn, phone=None):
-    """final_class별 건수. phone을 주면 그 사람 것만, 안 주면 전체."""
     if phone:
         cursor = conn.execute(
             "SELECT final_class, COUNT(*) FROM sorting_log WHERE phone = ? GROUP BY final_class",
@@ -155,7 +191,7 @@ def fetch_class_counts(conn, phone=None):
 
 
 # ---------------------------------------------------------------------
-# YOLO 검출기 (위치 + 분류를 한 번에 반환) - 4-5 스크립트와 동일한 방식
+# YOLO 검출기 (위치 + 분류를 한 번에 반환) - 4-5/gui_dashboard_yolo_only와 동일
 # ---------------------------------------------------------------------
 def load_labels(path):
     if not os.path.exists(path):
@@ -165,9 +201,6 @@ def load_labels(path):
 
 
 class TFLiteDetector:
-    """detector.tflite(ultralytics tflite export) 기반. 클래스 이름은
-    같은 폴더의 detector_labels.txt에서 읽어옵니다 (없으면 class_0, class_1...)."""
-
     def __init__(self, path, labels_path):
         self.interpreter = Interpreter(model_path=path)
         self.interpreter.allocate_tensors()
@@ -181,7 +214,6 @@ class TFLiteDetector:
         return f"class_{class_id}"
 
     def detect_and_crop(self, frame, conf_threshold=DETECTOR_CONF_THRESHOLD):
-        """반환: (crop 또는 None, confidence, box 또는 None, class_name 또는 None)"""
         input_details = self.interpreter.get_input_details()
         output_details = self.interpreter.get_output_details()
         in_h, in_w = input_details[0]["shape"][1:3]
@@ -235,9 +267,6 @@ class TFLiteDetector:
 
 
 class UltralyticsDetector:
-    """best.pt를 ultralytics로 바로 로딩. 클래스 이름은 모델 파일 안에
-    이미 저장돼 있어서 별도 파일 불필요."""
-
     def __init__(self, path):
         from ultralytics import YOLO
         self.model = YOLO(path)
@@ -301,47 +330,38 @@ def _load_candidate(folder, kind):
 
 
 def load_detector():
-    """찾은 YOLO 모델이 여러 개면 CNN 모델 선택(model_select.py)과 똑같이
-    번호로 고르게 합니다. 커맨드라인 인자로 폴더명을 바로 줄 수도 있음
-    (예: python3 gui_dashboard_yolo_only.py 3class)."""
+    """YOLO는 선택 사항 - 없으면 None을 반환하고 CNN만 사용합니다. 후보가
+    여러 개면 번호로 고르게 합니다. (CNN 모델 선택은 이미 sys.argv[1]을 쓰고
+    있어서, YOLO 쪽은 커맨드라인 인자 없이 항상 번호 입력으로만 고릅니다.)"""
     candidates = find_detector_candidates()
     if not candidates:
+        print("YOLO 모델 없음 - CNN만 사용합니다 (그래도 정상 동작합니다)")
         return None
 
-    chosen = None
-
-    if len(sys.argv) > 1:
-        names = [os.path.basename(d) for d, _ in candidates]
-        if sys.argv[1] in names:
-            chosen = candidates[names.index(sys.argv[1])]
-
-    if chosen is None:
-        if len(candidates) == 1:
-            chosen = candidates[0]
-        else:
-            print("\n사용 가능한 YOLO 모델:")
-            for i, (d, kind) in enumerate(candidates, 1):
-                print(f"  {i}. {os.path.basename(d)} ({kind})")
-            while True:
-                sel = input("사용할 YOLO 모델 번호 입력 > ").strip()
-                if sel.isdigit() and 1 <= int(sel) <= len(candidates):
-                    chosen = candidates[int(sel) - 1]
-                    break
-                print("올바른 번호를 입력하세요.")
+    if len(candidates) == 1:
+        chosen = candidates[0]
+    else:
+        print("\n사용 가능한 YOLO 모델:")
+        for i, (d, kind) in enumerate(candidates, 1):
+            print(f"  {i}. {os.path.basename(d)} ({kind})")
+        while True:
+            sel = input("사용할 YOLO 모델 번호 입력 > ").strip()
+            if sel.isdigit() and 1 <= int(sel) <= len(candidates):
+                chosen = candidates[int(sel) - 1]
+                break
+            print("올바른 번호를 입력하세요.")
 
     folder, kind = chosen
     print(f"[YOLO 모델 선택] {os.path.basename(folder)} ({kind})")
     try:
         return _load_candidate(folder, kind)
     except Exception as e:
-        print(f"로딩 실패: {e}")
-        if kind == "pt":
-            print('-> 확인: python3 -c "import torch, ultralytics"')
+        print(f"로딩 실패 (CNN만 사용합니다): {e}")
         return None
 
 
 # ---------------------------------------------------------------------
-# STM32 시리얼 리스너 (연결되면 자동 트리거, 안 되면 조용히 비활성화)
+# STM32 시리얼 리스너
 # ---------------------------------------------------------------------
 class SerialListener(QThread):
     triggered = pyqtSignal()
@@ -395,24 +415,31 @@ class SerialListener(QThread):
 class Dashboard(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("재활용 분류 시스템 - 대시보드 (YOLO 단독)")
+        self.setWindowTitle("재활용 분류 시스템 - 대시보드 (YOLO→CNN 하이브리드)")
         self.resize(1400, 800)
 
         self.conn = init_db()
 
-        print("YOLO 모델 로딩...")
+        # --- CNN 모델(들) 로딩 (필수, 여러 개면 순서대로 재시도 대상) ---
+        model_path, class_names_path = select_model(MODELS_DIR)
+        print("CNN 모델 로딩...")
+        self.cnn_models = [self._load_cnn_model("기본", model_path, class_names_path)]
+        for name in list_available_models(MODELS_DIR):
+            folder = os.path.join(MODELS_DIR, name)
+            other_model_path = os.path.join(folder, "classifier.tflite")
+            other_class_names_path = os.path.join(folder, "class_names.txt")
+            if os.path.normpath(other_model_path) == os.path.normpath(model_path):
+                continue
+            print(f"대체 CNN 모델 로딩: {name}")
+            self.cnn_models.append(self._load_cnn_model(name, other_model_path, other_class_names_path))
+
+        # --- YOLO 검출기 (선택 사항) ---
+        print("YOLO 모델 로딩 시도...")
         self.detector = load_detector()
-        if self.detector is None:
-            QMessageBox.critical(
-                self, "오류",
-                f"YOLO 모델을 찾지 못했습니다.\n{DETECTOR_DIR} 또는 models/ 하위 폴더에\n"
-                "best.pt 또는 detector.tflite를 넣어주세요.",
-            )
-            sys.exit(1)
 
         self.current_phone = None
         self.last_frame = None
-        self.detected_box = None  # (x1, y1, x2, y2, class_name, conf) 또는 None
+        self.detected_box = None  # (x1, y1, x2, y2, class_name, conf) - 미리보기용
         self.serial_listener = None
 
         self.cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -428,9 +455,10 @@ class Dashboard(QWidget):
         self.preview_timer.timeout.connect(self._update_preview)
         self.preview_timer.start(30)
 
-        self.detect_timer = QTimer(self)
-        self.detect_timer.timeout.connect(self._run_detection)
-        self.detect_timer.start(DETECTOR_INTERVAL_MS)
+        if self.detector is not None:
+            self.detect_timer = QTimer(self)
+            self.detect_timer.timeout.connect(self._run_detection)
+            self.detect_timer.start(DETECTOR_INTERVAL_MS)
 
         self.db_timer = QTimer(self)
         self.db_timer.timeout.connect(self._refresh_db_views)
@@ -471,7 +499,7 @@ class Dashboard(QWidget):
         outer.setContentsMargins(16, 16, 16, 16)
         outer.setSpacing(12)
 
-        title = QLabel("재활용 분류 시스템 대시보드 (YOLO 단독 - 위치+분류 통합)")
+        title = QLabel("재활용 분류 시스템 대시보드 (YOLO → CNN 하이브리드)")
         title.setStyleSheet("font-size:20px; font-weight:bold;")
         outer.addWidget(title)
 
@@ -537,12 +565,17 @@ class Dashboard(QWidget):
         control_box.setLayout(control_layout)
         mid.addWidget(control_box)
 
+        # 최근 분류 결과 (최종 결정 + YOLO/CNN 각각의 판단 비교)
         result_box = QGroupBox("최근 분류 결과")
         result_layout = QVBoxLayout()
         self.result_label = QLabel("-")
         self.result_label.setStyleSheet("font-size:20px; font-weight:bold;")
         self.result_label.setAlignment(Qt.AlignCenter)
+        self.detail_label = QLabel("")
+        self.detail_label.setStyleSheet("color:#666; font-size:12px;")
+        self.detail_label.setWordWrap(True)
         result_layout.addWidget(self.result_label)
+        result_layout.addWidget(self.detail_label)
         result_box.setLayout(result_layout)
         mid.addWidget(result_box)
 
@@ -568,9 +601,9 @@ class Dashboard(QWidget):
 
         log_box = QGroupBox("최근 분류 기록 (DB)")
         log_layout = QVBoxLayout()
-        self.log_table = QTableWidget(0, 6)
+        self.log_table = QTableWidget(0, 7)
         self.log_table.setHorizontalHeaderLabels(
-            ["시각", "전화번호", "YOLO예측", "확신도", "최종", "포인트"]
+            ["시각", "전화번호", "YOLO", "CNN", "최종", "포인트", "판정"]
         )
         self.log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.log_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -605,6 +638,69 @@ class Dashboard(QWidget):
         splitter.setStretchFactor(1, 3)
         splitter.setStretchFactor(2, 4)
 
+    # ---------------- 모델 로딩 / CNN 다중모델 재시도 ----------------
+    def _load_cnn_model(self, name, model_path, class_names_path):
+        interpreter = Interpreter(model_path=model_path)
+        interpreter.allocate_tensors()
+        return {
+            "name": name,
+            "interpreter": interpreter,
+            "class_names": load_class_names(class_names_path),
+        }
+
+    def _classify_with_cnn_fallback(self, image):
+        """CNN 모델을 1순위부터 시도. 확신도 기준 미달이면 다음 모델로 재시도.
+        반환: (model_name, cnn_class, cnn_conf) - 전부 미달이면 그중 최고값."""
+        best = None
+        for model in self.cnn_models:
+            cnn_class, cnn_conf = classify(model["interpreter"], image, model["class_names"])
+            print(f"  [CNN:{model['name']}] class={cnn_class} conf={cnn_conf:.2f}")
+            if cnn_conf >= CNN_CONF_THRESHOLD:
+                return model["name"], cnn_class, cnn_conf
+            if best is None or cnn_conf > best[2]:
+                best = (model["name"], cnn_class, cnn_conf)
+        return best
+
+    def _classify_hybrid(self, frame):
+        """YOLO 먼저 시도 -> 확신도 충분하면 그걸로 확정. 부족하면(unknown) CNN
+        (다중모델 포함)으로 재시도. 반환값: dict로 모든 중간결과를 담아서 UI/DB에서
+        재사용."""
+        result = {
+            "yolo_class": None, "yolo_conf": 0.0, "box": None,
+            "cnn_model": None, "cnn_class": None, "cnn_conf": None,
+            "final_class": "unknown", "method": "",
+        }
+
+        crop = None
+        if self.detector is not None:
+            crop, yolo_conf, box, yolo_class = self.detector.detect_and_crop(frame)
+            result["yolo_class"] = yolo_class
+            result["yolo_conf"] = yolo_conf
+            result["box"] = box
+            print(f"  [YOLO] class={yolo_class} conf={yolo_conf:.2f}")
+
+            if yolo_class is not None and box is not None and yolo_conf >= DETECTOR_CONF_THRESHOLD:
+                result["final_class"] = yolo_class.strip().lower()
+                result["method"] = "YOLO"
+                return result
+
+        # YOLO가 없거나 확신도 부족 -> CNN으로 재시도
+        # (YOLO가 크롭을 줬으면 그 영역을, 아니면 고정 ROI/전체 프레임을 CNN에 입력)
+        image = crop if crop is not None else apply_roi(frame)
+        cnn_model, cnn_class, cnn_conf = self._classify_with_cnn_fallback(image)
+        result["cnn_model"] = cnn_model
+        result["cnn_class"] = cnn_class
+        result["cnn_conf"] = cnn_conf
+
+        if cnn_conf >= CNN_CONF_THRESHOLD:
+            result["final_class"] = cnn_class
+            result["method"] = f"CNN({cnn_model})"
+        else:
+            result["final_class"] = "unknown"
+            result["method"] = "YOLO+CNN 둘 다 확신도 부족"
+
+        return result
+
     # ---------------- 동작 ----------------
     def _apply_phone(self):
         text = self.phone_input.text().strip()
@@ -633,6 +729,9 @@ class Dashboard(QWidget):
         self.last_frame = frame
 
         display = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if FIXED_ROI is not None:
+            x1, y1, x2, y2 = FIXED_ROI
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         if self.detected_box is not None:
             x1, y1, x2, y2, class_name, conf = self.detected_box
@@ -651,6 +750,7 @@ class Dashboard(QWidget):
         self.preview_label.setPixmap(pix)
 
     def _run_detection(self):
+        """미리보기용 - YOLO 박스만 계속 갱신 (최종 판정은 트리거 시 별도로 다시 함)"""
         if self.detector is None or self.last_frame is None:
             return
         try:
@@ -667,15 +767,14 @@ class Dashboard(QWidget):
         frame = self.last_frame
         cv2.imwrite(LAST_CAPTURE_PATH, frame)  # ROI 조정용 디버그 저장
 
-        _, yolo_conf, box, yolo_class = self.detector.detect_and_crop(frame)
-        if yolo_class is not None and box is not None:
-            final_class = yolo_class.strip().lower()
-        else:
-            final_class = "unknown"
-            yolo_conf = yolo_conf or 0.0
+        r = self._classify_hybrid(frame)
+        final_class = r["final_class"]
 
-        self.result_label.setText(f"{final_class}  (확신도 {yolo_conf:.2f})")
-        self._set_status(f"분류 완료: {final_class}")
+        self.result_label.setText(f"{final_class}  ({r['method']})")
+        yolo_txt = f"{r['yolo_class']}({r['yolo_conf']:.2f})" if r["yolo_class"] else "-"
+        cnn_txt = f"{r['cnn_class']}({r['cnn_conf']:.2f})" if r["cnn_class"] else "(시도 안 함)"
+        self.detail_label.setText(f"YOLO: {yolo_txt}   |   CNN: {cnn_txt}")
+        self._set_status(f"분류 완료: {final_class} [{r['method']}]")
 
         if self.serial_listener:
             self.serial_listener.send_class(final_class)
@@ -689,8 +788,11 @@ class Dashboard(QWidget):
                 print(f"[알림] '{final_class}'는 포인트 규칙에 없는 클래스명입니다. "
                       f"db/points.py의 POINTS_PER_CLASS와 철자를 맞춰보세요.")
 
-        # cnn_class/cnn_confidence 컬럼은 예전 CNN 버전 스크립트로 테이블이 처음
-        # 만들어졌으면 NOT NULL일 수 있어서, YOLO 결과로 같이 채워넣음
+        # cnn_class/cnn_confidence는 NOT NULL일 수 있는 옛 스키마 대응 - CNN을 안
+        # 거쳤으면(YOLO로 바로 확정) YOLO 결과값으로 대신 채워넣음
+        cnn_class_val = r["cnn_class"] if r["cnn_class"] is not None else (r["yolo_class"] or "unknown")
+        cnn_conf_val = r["cnn_conf"] if r["cnn_conf"] is not None else r["yolo_conf"]
+
         self.conn.execute(
             """
             INSERT INTO sorting_log
@@ -701,10 +803,10 @@ class Dashboard(QWidget):
             (
                 datetime.now().isoformat(),
                 self.current_phone,
-                yolo_class or "unknown",
-                yolo_conf,
-                yolo_class,
-                yolo_conf,
+                cnn_class_val,
+                cnn_conf_val,
+                r["yolo_class"],
+                r["yolo_conf"],
                 final_class,
                 points,
             ),
@@ -716,9 +818,11 @@ class Dashboard(QWidget):
     def _refresh_db_views(self):
         rows = fetch_recent_log(self.conn, RECENT_LOG_ROWS)
         self.log_table.setRowCount(len(rows))
-        for r, (row_id, ts, phone, yolo_class, conf, final_class, points) in enumerate(rows):
-            conf_disp = f"{conf:.2f}" if conf is not None else "-"
-            values = [ts[:19], phone or "-", yolo_class or "-", conf_disp, final_class, str(points)]
+        for r, (row_id, ts, phone, cnn_class, cnn_conf, yolo_class, yolo_conf,
+                final_class, points) in enumerate(rows):
+            yolo_disp = f"{yolo_class}({yolo_conf:.2f})" if yolo_class and yolo_conf is not None else "-"
+            cnn_disp = f"{cnn_class}({cnn_conf:.2f})" if cnn_class and cnn_conf is not None else "-"
+            values = [ts[:19], phone or "-", yolo_disp, cnn_disp, final_class, str(points), ""]
             for c, val in enumerate(values):
                 self.log_table.setItem(r, c, QTableWidgetItem(val))
 
@@ -765,8 +869,9 @@ class Dashboard(QWidget):
 
     def closeEvent(self, event):
         self.preview_timer.stop()
-        self.detect_timer.stop()
         self.db_timer.stop()
+        if self.detector is not None and hasattr(self, "detect_timer"):
+            self.detect_timer.stop()
         if self.serial_listener:
             self.serial_listener.stop()
             self.serial_listener.wait(1000)
@@ -789,9 +894,10 @@ if __name__ == "__main__":
 # =====================================================================
 # 확인/맞춰야 할 것
 #   - SERIAL_PORT: 핀헤더가 아니면 /dev/ttyACM0 등으로 변경
-#   - models/detector/ (또는 models/아무폴더/)에 best.pt 또는
-#     detector.tflite + detector_labels.txt 필요
-#   - 클래스 이름이 "metal"/"plastic"/"paper"와 정확히 일치해야 포인트 적립됨
-#   - DETECTOR_CONF_THRESHOLD: 실제 테스트하면서 오분류율 보고 조정
+#   - CNN 모델(models/모델이름/classifier.tflite + class_names.txt)은 필수
+#   - YOLO(models/detector/ 또는 models/아무폴더/의 best.pt나 detector.tflite)는
+#     선택 사항 - 없으면 CNN만으로 동작
+#   - DETECTOR_CONF_THRESHOLD: YOLO 결과를 바로 확정할지 결정하는 기준값
+#   - CNN_CONF_THRESHOLD: CNN 최종 확정 기준값
 #   - Jetson 본체 데스크톱(또는 VNC)에서 실행해야 창이 뜸 (SSH만으로는 안 됨)
 # =====================================================================
