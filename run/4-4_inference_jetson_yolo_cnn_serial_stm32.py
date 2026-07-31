@@ -133,6 +133,9 @@ def init_db():
     )
     _ensure_column(conn, "sorting_log", "yolo_confidence", "REAL")
     _ensure_column(conn, "sorting_log", "points_awarded", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "sorting_log", "yolo_ms", "REAL")    # YOLO 위치검출 소요시간(ms)
+    _ensure_column(conn, "sorting_log", "cnn_ms", "REAL")     # CNN 분류 소요시간(ms)
+    _ensure_column(conn, "sorting_log", "infer_ms", "REAL")   # 전체 추론 소요시간(ms) = yolo_ms + cnn_ms
     init_users_table(conn)
     conn.commit()
     return conn
@@ -414,16 +417,25 @@ def main():
                 yolo_conf = 0.0
                 image = None
                 box = None
+                t0 = time.perf_counter()
                 if detector is not None:
                     image, yolo_conf, box = detector.detect_and_crop(frame)
+                yolo_ms = (time.perf_counter() - t0) * 1000
                 if image is None:
                     image = apply_roi(frame)
                 last_box = box
                 last_box_until = time.time() + 3
 
                 # 2) CNN으로 최종 분류
+                t1 = time.perf_counter()
                 cnn_class, cnn_conf = classify(cnn_interpreter, image, class_names)
-                print(f"YOLO conf={yolo_conf:.2f} / CNN class={cnn_class} conf={cnn_conf:.2f}")
+                cnn_ms = (time.perf_counter() - t1) * 1000
+                infer_ms = yolo_ms + cnn_ms
+                print(
+                    f"YOLO conf={yolo_conf:.2f}({yolo_ms:.1f}ms) / "
+                    f"CNN class={cnn_class} conf={cnn_conf:.2f}({cnn_ms:.1f}ms) / "
+                    f"총 {infer_ms:.1f}ms"
+                )
 
                 final_class = cnn_class if cnn_conf >= CNN_CONF_THRESHOLD else "unknown"
 
@@ -447,8 +459,8 @@ def main():
                     """
                     INSERT INTO sorting_log
                         (timestamp, phone, yolo_confidence, cnn_class, cnn_confidence,
-                         final_class, points_awarded)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                         final_class, points_awarded, yolo_ms, cnn_ms, infer_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         datetime.now().isoformat(),
@@ -458,6 +470,9 @@ def main():
                         cnn_conf,
                         final_class,
                         points,
+                        yolo_ms,
+                        cnn_ms,
+                        infer_ms,
                     ),
                 )
                 conn.commit()

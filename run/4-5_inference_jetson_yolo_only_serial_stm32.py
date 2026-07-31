@@ -130,6 +130,7 @@ def init_db():
     _ensure_column(conn, "sorting_log", "yolo_class", "TEXT")
     _ensure_column(conn, "sorting_log", "yolo_confidence", "REAL")
     _ensure_column(conn, "sorting_log", "points_awarded", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "sorting_log", "infer_ms", "REAL")  # YOLO 추론 1회 소요시간(ms)
     init_users_table(conn)
     conn.commit()
     return conn
@@ -428,7 +429,9 @@ def main():
                 cv2.imwrite(LAST_CAPTURE_PATH, frame)
 
                 # YOLO 한 번으로 위치 + 클래스 다 얻음 (CNN 없음)
+                t0 = time.perf_counter()
                 _, yolo_conf, box, yolo_class = detector.detect_and_crop(frame)
+                infer_ms = (time.perf_counter() - t0) * 1000
                 last_box = box
                 last_box_label = f"{yolo_class} {yolo_conf:.2f}" if yolo_class else ""
                 last_box_until = time.time() + 3
@@ -438,7 +441,7 @@ def main():
                 else:
                     final_class = "unknown"
 
-                print(f"YOLO class={yolo_class} conf={yolo_conf:.2f} -> final={final_class}")
+                print(f"YOLO class={yolo_class} conf={yolo_conf:.2f} -> final={final_class} ({infer_ms:.1f} ms)")
 
                 last_result_text = f"{final_class} ({yolo_conf:.2f})"
                 last_result_until = time.time() + 3
@@ -462,8 +465,8 @@ def main():
                     """
                     INSERT INTO sorting_log
                         (timestamp, phone, cnn_class, cnn_confidence, yolo_class,
-                         yolo_confidence, final_class, points_awarded)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         yolo_confidence, final_class, points_awarded, infer_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         datetime.now().isoformat(),
@@ -474,6 +477,7 @@ def main():
                         yolo_conf,
                         final_class,
                         points,
+                        infer_ms,
                     ),
                 )
                 conn.commit()

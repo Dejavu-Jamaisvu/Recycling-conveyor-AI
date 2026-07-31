@@ -91,6 +91,14 @@ trigger_event = threading.Event()
 # ---------------------------------------------------------------------
 # 초기화
 # ---------------------------------------------------------------------
+def _ensure_column(conn, table, column, coltype):
+    """예전 실행으로 이미 만들어진 sorting_log.db를 이어서 쓸 때 새로 추가된
+    컬럼이 없으면 채워넣습니다."""
+    cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(
@@ -106,6 +114,7 @@ def init_db():
         )
         """
     )
+    _ensure_column(conn, "sorting_log", "infer_ms", "REAL")  # CNN 추론 1회 소요시간(ms)
     init_users_table(conn)
     conn.commit()
     return conn
@@ -250,8 +259,10 @@ def main():
 
                 # 1) 고정 ROI 적용 후 CNN 분류
                 image = apply_roi(frame)
+                t0 = time.perf_counter()
                 cnn_class, cnn_conf = classify(cnn_interpreter, image, class_names)
-                print(f"CNN class={cnn_class} conf={cnn_conf:.2f}")
+                infer_ms = (time.perf_counter() - t0) * 1000
+                print(f"CNN class={cnn_class} conf={cnn_conf:.2f} ({infer_ms:.1f} ms)")
 
                 final_class = cnn_class if cnn_conf >= CNN_CONF_THRESHOLD else "unknown"
 
@@ -274,10 +285,10 @@ def main():
                 conn.execute(
                     """
                     INSERT INTO sorting_log
-                        (timestamp, phone, cnn_class, cnn_confidence, final_class, points_awarded)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (timestamp, phone, cnn_class, cnn_confidence, final_class, points_awarded, infer_ms)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (datetime.now().isoformat(), phone, cnn_class, cnn_conf, final_class, points),
+                    (datetime.now().isoformat(), phone, cnn_class, cnn_conf, final_class, points, infer_ms),
                 )
                 conn.commit()
 
