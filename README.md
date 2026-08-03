@@ -39,8 +39,8 @@ Jetson Nano(AI 추론 · GUI · DB) · STM32F411(실시간 상태머신 · 서�
 │   │   └── 4-1 ~ 4-5_*.py               # 개발 단계별 CLI 버전(GPIO 직접제어 → STM32 UART 전환 등)
 │   ├── models/
 │   │   ├── first_test/                  # 최초 YOLO/CNN 학습 실험
-│   │   ├── 3_class/                     # 자체 촬영 데이터셋(402장)
-│   │   └── trash_line_3class/           # Roboflow 공개 데이터셋(2,724장) — 최종 채택
+│   │   ├── 3_class/                     # Roboflow 데이터셋 — 바운딩박스(사각형)로 라벨링(402장)
+│   │   └── trash_line_3class/           # Roboflow 데이터셋 — 폴리곤(선)으로 물체 윤곽을 따라 라벨링(2,724장) — 최종 채택
 │   └── db/                              # sorting_log.db 초기화/조회/포인트 로직
 │
 └── STM32/
